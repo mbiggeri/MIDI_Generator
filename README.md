@@ -61,8 +61,7 @@ Configuration and Installation
 
     Clone the Repository (or download the files):
 
-    git clone [https://github.com/YOUR_USERNAME/YOUR_REPOSITORY_NAME.git](https://github.com/YOUR_USERNAME/YOUR_REPOSITORY_NAME.git)
-    cd YOUR_REPOSITORY_NAME
+    git clone https://github.com/mbiggeri/PianoGenerator.git
 
     Download the Pre-trained Model and Vocabularies:
 
@@ -110,7 +109,7 @@ Usage
 
 Project Structure (Example)
 
-YOUR_REPOSITORY_NAME/
+PianoGenerator/
 │
 ├── music_generator_gui.py     # The main GUI application script
 ├── model_checkpoint.pt      # (Example) Your pre-trained model (to be placed according to paths)
@@ -133,7 +132,3 @@ Contributing
 
 Contributions are welcome! If you want to contribute, please open an issue to discuss the proposed changes or submit a Pull Request.
 License
-
-This project is released under the [YOUR_LICENSE_NAME, e.g., MIT] License. See the LICENSE file for more details (if you include one).
-
-This README was generated for the project by [Your Name/Nickname Here].
