@@ -144,13 +144,19 @@ def generate_sequence(model, midi_tokenizer, metadata_vocab_map, metadata_prompt
             logits = model.generator(decoder_output[:, -1, :]) # Shape: [batch, vocab_size]
             
             # 4. Sampling (Top-K, Temperatura) - invariato
-            scaled_logits = logits / temperature
-            if top_k is not None and top_k > 0:
-                v, _ = torch.topk(scaled_logits, min(top_k, scaled_logits.size(-1)))
-                scaled_logits[scaled_logits < v[:, [-1]]] = -float('Inf')
-
-            probs = F.softmax(scaled_logits, dim=-1)
-            next_token_id_tensor = torch.multinomial(probs, num_samples=1)
+            if temperature > 0:
+                # Logica standard con temperatura e top_k
+                scaled_logits = logits / temperature
+                if top_k is not None and top_k > 0:
+                    v, _ = torch.topk(scaled_logits, min(top_k, scaled_logits.size(-1)))
+                    scaled_logits[scaled_logits < v[:, [-1]]] = -float('Inf')
+                
+                probs = F.softmax(scaled_logits, dim=-1)
+                next_token_id_tensor = torch.multinomial(probs, num_samples=1)
+            else:
+                # Greedy decoding: scegli il token con la probabilità più alta (nessuna casualità)
+                # top_k viene ignorato in questa modalità
+                next_token_id_tensor = torch.argmax(logits, dim=-1, keepdim=True)
             next_token_id = next_token_id_tensor.item()
 
             # 5. Gestione EOS e aggiunta del nuovo token - invariato
@@ -172,23 +178,22 @@ def generate_sequence(model, midi_tokenizer, metadata_vocab_map, metadata_prompt
 
 
 def generate_multi_chunk_midi(model, midi_tokenizer, metadata_vocab_map, metadata_prompt,
-                              total_target_tokens, model_chunk_capacity, generation_config, device):
+                              total_target_tokens, model_chunk_capacity, generation_config, device,
+                              initial_primer_ids=None): # MODIFICATO
     all_generated_tokens = []
-    current_primer_ids = []
-    
-    # Parametri di generazione
+    current_primer_ids = initial_primer_ids.copy() if initial_primer_ids else [] # MODIFICATO
+
     PRIMER_TOKEN_COUNT = 50
     MIN_TOKENS_PER_CHUNK = 100
     max_new_tokens_per_chunk = min(2048, model_chunk_capacity - PRIMER_TOKEN_COUNT - 5)
+    eos_midi_id = midi_tokenizer["EOS_None"]
 
     while len(all_generated_tokens) < total_target_tokens:
         remaining_tokens_to_generate = total_target_tokens - len(all_generated_tokens)
         current_pass_max_new = min(max_new_tokens_per_chunk, remaining_tokens_to_generate)
-
-        if len(current_primer_ids) + current_pass_max_new + 1 > model_chunk_capacity:
-            break # Evita di superare la capacità
-
+        if len(current_primer_ids) + current_pass_max_new + 1 > model_chunk_capacity: break
         logging.info(f"Generazione chunk. Totale: {len(all_generated_tokens)}/{total_target_tokens}.")
+        
         newly_generated_ids = generate_sequence(
             model, midi_tokenizer, metadata_vocab_map, metadata_prompt,
             max_new_tokens=current_pass_max_new,
@@ -197,93 +202,82 @@ def generate_multi_chunk_midi(model, midi_tokenizer, metadata_vocab_map, metadat
             top_k=generation_config.get("top_k", 40),
             device=device,
             primer_token_ids=current_primer_ids,
-            model_max_pe_len=model_chunk_capacity
-        )
-
+            model_max_pe_len=model_chunk_capacity)
         if not newly_generated_ids: break
-
-        eos_midi_id = midi_tokenizer["EOS_None"]
-        chunk_ended_with_eos = eos_midi_id in newly_generated_ids
         
-        tokens_to_add = newly_generated_ids
-        if chunk_ended_with_eos:
-            tokens_to_add = newly_generated_ids[:newly_generated_ids.index(eos_midi_id) + 1]
-
+        chunk_ended_with_eos = eos_midi_id in newly_generated_ids
+        tokens_to_add = newly_generated_ids[:newly_generated_ids.index(eos_midi_id) + 1] if chunk_ended_with_eos else newly_generated_ids
         all_generated_tokens.extend(tokens_to_add)
 
         if chunk_ended_with_eos:
-            if len(all_generated_tokens) >= total_target_tokens * 0.8:
-                logging.info("EOS generato e lunghezza target raggiunta.")
-                break
-            # Prepara il primer per il prossimo chunk senza l'EOS
+            if len(all_generated_tokens) >= total_target_tokens * 0.8: break
             primer_candidate = tokens_to_add[:-1]
             current_primer_ids = primer_candidate[-PRIMER_TOKEN_COUNT:] if len(primer_candidate) > PRIMER_TOKEN_COUNT else []
         else:
-            current_primer_ids = tokens_to_add[-PRIMER_TOKEN_COUNT:] if len(tokens_to_add) >= PRIMER_TOKEN_COUNT else tokens_to_add
-
-    # Assicura un EOS finale se non già presente
-    if all_generated_tokens and all_generated_tokens[-1] != midi_tokenizer["EOS_None"]:
-        all_generated_tokens.append(midi_tokenizer["EOS_None"])
-        
+            current_primer_ids = tokens_to_add[-PRIMER_TOKEN_COUNT:]
+    if all_generated_tokens and all_generated_tokens[-1] != eos_midi_id:
+        all_generated_tokens.append(eos_midi_id)
     return all_generated_tokens
 
 # --- FUNZIONE PRINCIPALE DI GENERAZIONE (da chiamare dalla GUI) ---
-
 def run_generation(model_path, midi_vocab_path, meta_vocab_path, 
-                   metadata_prompt, output_dir, total_tokens, temperature,
-                   update_status_callback=None):
-    """
-    Funzione orchestratrice per la generazione musicale.
-    """
+                   metadata_prompt, output_dir, total_tokens, temperature, top_k,
+                   primer_midi_path=None, update_status_callback=None):
     try:
-        # Funzione di callback per aggiornare la GUI
         def log_and_update(message):
             logging.info(message)
-            if update_status_callback:
-                update_status_callback(message)
-
+            if update_status_callback: update_status_callback(message)
         log_and_update("Inizio generazione...")
-
         DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         log_and_update(f"Device rilevato: {DEVICE}")
 
-        # 1. Carica vocabolari
         log_and_update("Caricamento vocabolari...")
         midi_tokenizer = miditok.REMI(params=str(midi_vocab_path))
         with open(meta_vocab_path, 'r', encoding='utf-8') as f:
             metadata_vocab_map = json.load(f)['token_to_id']
 
-        # 2. Carica modello
+        # NUOVO: Logica per caricare e tokenizzare il primer MIDI
+        primer_token_ids = []
+        if primer_midi_path and Path(primer_midi_path).exists():
+            log_and_update(f"Tokenizzazione del primer MIDI: {primer_midi_path}")
+            try:
+                # miditok.tokenizer.encode() restituisce una lista di liste di token (una per traccia)
+                primer_tokens_per_track = midi_tokenizer.encode(primer_midi_path)
+                # Assumiamo di usare la prima traccia o un unico stream di token
+                if primer_tokens_per_track:
+                    primer_token_ids = primer_tokens_per_track[0].ids
+                    log_and_update(f"Primer di {len(primer_token_ids)} token caricato con successo.")
+                else:
+                    log_and_update("ATTENZIONE: Il file MIDI di primer è vuoto o non ha prodotto token. Verrà ignorato.")
+            except Exception as e:
+                log_and_update(f"ATTENZIONE: Impossibile caricare il primer MIDI. Errore: {e}. Continuo senza.")
+        
         log_and_update("Caricamento modello...")
         checkpoint = torch.load(model_path, map_location=DEVICE)
         model_params = checkpoint.get('model_params')
-        if not model_params:
-            raise ValueError("'model_params' non trovato nel checkpoint.")
+        if not model_params: raise ValueError("'model_params' non trovato nel checkpoint.")
         
         model = Seq2SeqTransformer(**model_params).to(DEVICE)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         log_and_update("Modello caricato con successo.")
 
-        # 3. Genera sequenza di token
-        generation_config = {"temperature": temperature, "top_k": 40}
+        # MODIFICATO: Passaggio dei nuovi parametri
+        generation_config = {"temperature": temperature, "top_k": top_k}
         model_chunk_capacity = model_params.get('max_pe_len', 1024)
-
         log_and_update(f"Prompt metadati: {metadata_prompt}")
         generated_token_ids = generate_multi_chunk_midi(
             model, midi_tokenizer, metadata_vocab_map, metadata_prompt,
             total_target_tokens=total_tokens,
             model_chunk_capacity=model_chunk_capacity,
             generation_config=generation_config,
-            device=DEVICE
+            device=DEVICE,
+            initial_primer_ids=primer_token_ids # Nuovo
         )
 
-        if not generated_token_ids:
-            raise RuntimeError("La generazione non ha prodotto token.")
-
+        if not generated_token_ids: raise RuntimeError("La generazione non ha prodotto token.")
         log_and_update(f"Generati {len(generated_token_ids)} token MIDI.")
         
-        # 4. Decodifica e salva il file MIDI
         log_and_update("Decodifica dei token in MIDI...")
         generated_midi_object = midi_tokenizer.decode(generated_token_ids)
         
@@ -291,17 +285,14 @@ def run_generation(model_path, midi_vocab_path, meta_vocab_path,
         prompt_name_part = "_".join(metadata_prompt).replace("=", "").replace("/", "")[:50]
         output_filename = f"generated_{prompt_name_part}_{timestamp}.mid"
         output_path = Path(output_dir) / output_filename
-        
         output_path.parent.mkdir(parents=True, exist_ok=True)
         generated_midi_object.dump_midi(str(output_path))
         
         final_message = f"Successo! File MIDI salvato in:\n{output_path}"
         log_and_update(final_message)
         return final_message
-
     except Exception as e:
         error_message = f"ERRORE: {e}"
         logging.error("Errore durante la generazione.", exc_info=True)
-        if update_status_callback:
-            update_status_callback(error_message)
+        if update_status_callback: update_status_callback(error_message)
         return error_message
