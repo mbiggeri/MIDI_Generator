@@ -82,11 +82,10 @@ class Seq2SeqTransformer(nn.Module):
 
 # --- FUNZIONI DI GENERAZIONE (modificate per essere più robuste) ---
 
-# Sostituisci la vecchia funzione `generate_sequence` in `generate_music.py` con questa
-
+# MODIFICATO: La firma della funzione ora accetta `rest_ids`
 def generate_sequence(model, midi_tokenizer, metadata_vocab_map, metadata_prompt,
                       max_new_tokens, min_new_tokens, temperature, top_k, device,
-                      primer_token_ids, model_max_pe_len):
+                      primer_token_ids, model_max_pe_len, max_rest_penalty, rest_ids):
     model.eval()
     
     # Costanti token speciali (come prima)
@@ -116,36 +115,33 @@ def generate_sequence(model, midi_tokenizer, metadata_vocab_map, metadata_prompt
         src_seq = torch.tensor([[sos_meta_id] + meta_token_ids + [eos_meta_id]], dtype=torch.long, device=device)
         src_padding_mask = (src_seq == meta_pad_id)
         
-        # Calcola l'output dell'encoder (chiamato 'memory') una sola volta.
-        # Questa è la rappresentazione del contesto che il decoder userà ad ogni passo.
         memory = model.encode(src_seq, src_padding_mask)
 
         # 2. Inizializzazione della sequenza di output (TGT)
-        # Inizia con il token SOS e, opzionalmente, con un "primer"
         initial_ids = [sos_midi_id] + (primer_token_ids if primer_token_ids else [])
         tgt_tokens = torch.tensor([initial_ids], dtype=torch.long, device=device)
         
-        # 3. Loop di generazione autoregressivo (ora più efficiente)
+        # 3. Loop di generazione autoregressivo
         for i in range(max_new_tokens):
             current_total_len = tgt_tokens.size(1)
             if current_total_len >= model_max_pe_len:
                 logging.warning(f"Raggiunta capacità massima del modello ({model_max_pe_len}). Interruzione.")
                 break
 
-            # Crea la maschera causale per la sequenza di output corrente
             tgt_mask = torch.triu(torch.ones(current_total_len, current_total_len, device=device, dtype=torch.bool), diagonal=1)
             
-            # --- CHIAMATA AL DECODER ---
-            # Passiamo l'intera sequenza generata finora.
-            # `memory` (dall'encoder) è sempre lo stesso.
             decoder_output = model.decode(tgt=tgt_tokens, memory=memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_padding_mask)
             
-            # Dal decoder_output, usiamo solo l'ultimo token per predire il successivo
-            logits = model.generator(decoder_output[:, -1, :]) # Shape: [batch, vocab_size]
+            logits = model.generator(decoder_output[:, -1, :])
+            
+            # --- LOGICA DI PENALIZZAZIONE DINAMICA ---
+            if max_rest_penalty > 0 and rest_ids is not None and rest_ids.numel() > 0:
+                progress = i / max_new_tokens
+                current_penalty = max_rest_penalty * progress
+                logits[:, rest_ids] -= current_penalty
             
             # 4. Sampling (Top-K, Temperatura) - invariato
             if temperature > 0:
-                # Logica standard con temperatura e top_k
                 scaled_logits = logits / temperature
                 if top_k is not None and top_k > 0:
                     v, _ = torch.topk(scaled_logits, min(top_k, scaled_logits.size(-1)))
@@ -154,8 +150,6 @@ def generate_sequence(model, midi_tokenizer, metadata_vocab_map, metadata_prompt
                 probs = F.softmax(scaled_logits, dim=-1)
                 next_token_id_tensor = torch.multinomial(probs, num_samples=1)
             else:
-                # Greedy decoding: scegli il token con la probabilità più alta (nessuna casualità)
-                # top_k viene ignorato in questa modalità
                 next_token_id_tensor = torch.argmax(logits, dim=-1, keepdim=True)
             next_token_id = next_token_id_tensor.item()
 
@@ -164,24 +158,22 @@ def generate_sequence(model, midi_tokenizer, metadata_vocab_map, metadata_prompt
                 _, top_2_indices = torch.topk(probs, 2, dim=-1)
                 if top_2_indices[0, 0].item() == eos_midi_id and top_2_indices.size(1) > 1:
                     next_token_id_tensor = top_2_indices[0, 1].unsqueeze(0).unsqueeze(0)
-                else: # Se anche il secondo è EOS o c'è un solo token, forza la fine
+                else:
                     break 
             
             if next_token_id == eos_midi_id and tgt_tokens.size(1) - len(initial_ids) >= min_new_tokens:
                 break
             
-            # Aggiungi il nuovo token alla sequenza per il prossimo passo
             tgt_tokens = torch.cat((tgt_tokens, next_token_id_tensor), dim=1)
 
-    # Ritorna i token generati (escludendo il SOS iniziale e il primer)
     return tgt_tokens[0, len(initial_ids):].tolist()
 
 
 def generate_multi_chunk_midi(model, midi_tokenizer, metadata_vocab_map, metadata_prompt,
                               total_target_tokens, model_chunk_capacity, generation_config, device,
-                              initial_primer_ids=None): # MODIFICATO
+                              initial_primer_ids=None, rest_ids=None): # MODIFICATO
     all_generated_tokens = []
-    current_primer_ids = initial_primer_ids.copy() if initial_primer_ids else [] # MODIFICATO
+    current_primer_ids = initial_primer_ids.copy() if initial_primer_ids else [] 
 
     PRIMER_TOKEN_COUNT = 50
     MIN_TOKENS_PER_CHUNK = 100
@@ -194,15 +186,18 @@ def generate_multi_chunk_midi(model, midi_tokenizer, metadata_vocab_map, metadat
         if len(current_primer_ids) + current_pass_max_new + 1 > model_chunk_capacity: break
         logging.info(f"Generazione chunk. Totale: {len(all_generated_tokens)}/{total_target_tokens}.")
         
+        # MODIFICATO: Passaggio dei nuovi parametri (`max_rest_penalty` e `rest_ids`)
         newly_generated_ids = generate_sequence(
             model, midi_tokenizer, metadata_vocab_map, metadata_prompt,
             max_new_tokens=current_pass_max_new,
             min_new_tokens=min(MIN_TOKENS_PER_CHUNK, current_pass_max_new),
             temperature=generation_config.get("temperature", 0.75),
             top_k=generation_config.get("top_k", 40),
+            max_rest_penalty=generation_config.get("max_rest_penalty", 0.0), # Ottiene il valore da config
             device=device,
             primer_token_ids=current_primer_ids,
-            model_max_pe_len=model_chunk_capacity)
+            model_max_pe_len=model_chunk_capacity,
+            rest_ids=rest_ids) # Passa i rest_ids
         if not newly_generated_ids: break
         
         chunk_ended_with_eos = eos_midi_id in newly_generated_ids
@@ -219,9 +214,52 @@ def generate_multi_chunk_midi(model, midi_tokenizer, metadata_vocab_map, metadat
         all_generated_tokens.append(eos_midi_id)
     return all_generated_tokens
 
+# --- FUNZIONE DI ANALISI MODELLO ---
+def get_model_info(model_path: str) -> dict:
+    """
+    Carica un checkpoint del modello e ne estrae le informazioni sull'architettura.
+
+    Args:
+        model_path: Il percorso del file del modello (.pt).
+
+    Returns:
+        Un dizionario contenente i parametri del modello o un dizionario di errore.
+    """
+    if not model_path or not Path(model_path).exists():
+        return {"error": "Selezionare un percorso valido per il modello."}
+
+    try:
+        # Carica il checkpoint su CPU per evitare problemi di memoria GPU solo per l'analisi
+        checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+
+        model_params = checkpoint.get('model_params')
+        if not model_params:
+            return {"error": "'model_params' non trovato nel checkpoint del modello."}
+
+        # Istanzia temporaneamente il modello per calcolare i parametri
+        model = Seq2SeqTransformer(**model_params)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        # Prepara un dizionario con le informazioni formattate
+        info = {
+            "Parametri Addestrabili": f"{trainable_params:,}".replace(",", "."),
+            "Dimensione Embedding (d_model)": model_params.get('emb_size', 'N/D'),
+            "Attention Heads": model_params.get('nhead', 'N/D'),
+            "Livelli Encoder": model_params.get('num_encoder_layers', 'N/D'),
+            "Livelli Decoder": model_params.get('num_decoder_layers', 'N/D'),
+            "Dimensione Feedforward": model_params.get('dim_feedforward', 'N/D'),
+            "Max Lunghezza Sequenza": model_params.get('max_pe_len', 'N/D'),
+        }
+        return info
+
+    except Exception as e:
+        logging.error(f"Errore durante l'analisi del modello: {e}", exc_info=True)
+        return {"error": f"Impossibile leggere il file del modello.\nErrore: {e}"}
+
 # --- FUNZIONE PRINCIPALE DI GENERAZIONE (da chiamare dalla GUI) ---
+
 def run_generation(model_path, midi_vocab_path, meta_vocab_path, 
-                   metadata_prompt, output_dir, total_tokens, temperature, top_k,
+                   metadata_prompt, output_dir, total_tokens, temperature, top_k, max_rest_penalty,
                    primer_midi_path=None, update_status_callback=None):
     try:
         def log_and_update(message):
@@ -236,14 +274,23 @@ def run_generation(model_path, midi_vocab_path, meta_vocab_path,
         with open(meta_vocab_path, 'r', encoding='utf-8') as f:
             metadata_vocab_map = json.load(f)['token_to_id']
 
-        # NUOVO: Logica per caricare e tokenizzare il primer MIDI
+        # NUOVO: Trova dinamicamente i token di "pausa" (Rest) per la penalizzazione
+        rest_ids = None
+        if max_rest_penalty > 0:
+            # miditok > 2.1.8 usa `vocab.token_to_id`, versioni precedenti potrebbero usare `vocab.token_to_event`
+            vocab_map = midi_tokenizer.vocab.token_to_id if hasattr(midi_tokenizer.vocab, 'token_to_id') else midi_tokenizer.vocab.token_to_event
+            rest_token_ids_list = [i for t, i in vocab_map.items() if t.startswith("Rest_")]
+            if rest_token_ids_list:
+                rest_ids = torch.tensor(rest_token_ids_list, device=DEVICE, dtype=torch.long)
+                log_and_update(f"Trovati {len(rest_token_ids_list)} token di pausa per la penalizzazione.")
+            else:
+                log_and_update("ATTENZIONE: Nessun token di pausa trovato nel vocabolario. La penalizzazione non verrà applicata.")
+
         primer_token_ids = []
         if primer_midi_path and Path(primer_midi_path).exists():
             log_and_update(f"Tokenizzazione del primer MIDI: {primer_midi_path}")
             try:
-                # miditok.tokenizer.encode() restituisce una lista di liste di token (una per traccia)
                 primer_tokens_per_track = midi_tokenizer.encode(primer_midi_path)
-                # Assumiamo di usare la prima traccia o un unico stream di token
                 if primer_tokens_per_track:
                     primer_token_ids = primer_tokens_per_track[0].ids
                     log_and_update(f"Primer di {len(primer_token_ids)} token caricato con successo.")
@@ -262,17 +309,24 @@ def run_generation(model_path, midi_vocab_path, meta_vocab_path,
         model.eval()
         log_and_update("Modello caricato con successo.")
 
-        # MODIFICATO: Passaggio dei nuovi parametri
-        generation_config = {"temperature": temperature, "top_k": top_k}
+        # MODIFICATO: Passaggio dei nuovi parametri in generation_config
+        generation_config = {
+            "temperature": temperature, 
+            "top_k": top_k, 
+            "max_rest_penalty": max_rest_penalty # Nuovo
+        }
         model_chunk_capacity = model_params.get('max_pe_len', 1024)
         log_and_update(f"Prompt metadati: {metadata_prompt}")
+
+        # MODIFICATO: Passaggio di `rest_ids` a `generate_multi_chunk_midi`
         generated_token_ids = generate_multi_chunk_midi(
             model, midi_tokenizer, metadata_vocab_map, metadata_prompt,
             total_target_tokens=total_tokens,
             model_chunk_capacity=model_chunk_capacity,
             generation_config=generation_config,
             device=DEVICE,
-            initial_primer_ids=primer_token_ids # Nuovo
+            initial_primer_ids=primer_token_ids,
+            rest_ids=rest_ids # Nuovo
         )
 
         if not generated_token_ids: raise RuntimeError("La generazione non ha prodotto token.")
