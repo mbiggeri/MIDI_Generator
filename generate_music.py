@@ -72,7 +72,7 @@ class Seq2SeqTransformer(nn.Module):
     def encode(self, src, src_mask):
         src_emb = self.positional_encoding(self.src_tok_emb(src) * math.sqrt(self.emb_size))
         return self.transformer.encoder(src_emb, src_key_padding_mask=src_mask)
-
+    
     def decode(self, tgt, memory, tgt_mask, tgt_padding_mask=None, memory_key_padding_mask=None):
         tgt_emb = self.positional_encoding(self.tgt_tok_emb(tgt) * math.sqrt(self.emb_size))
         return self.transformer.decoder(tgt_emb, memory,
@@ -82,12 +82,14 @@ class Seq2SeqTransformer(nn.Module):
 
 # --- FUNZIONI DI GENERAZIONE (modificate per essere più robuste) ---
 
+# Sostituisci la vecchia funzione `generate_sequence` in `generate_music.py` con questa
+
 def generate_sequence(model, midi_tokenizer, metadata_vocab_map, metadata_prompt,
                       max_new_tokens, min_new_tokens, temperature, top_k, device,
                       primer_token_ids, model_max_pe_len):
     model.eval()
     
-    # Costanti token speciali
+    # Costanti token speciali (come prima)
     META_SOS_TOKEN_NAME = "<sos_meta>"
     META_EOS_TOKEN_NAME = "<eos_meta>"
     META_UNK_TOKEN_NAME = "<unk_meta>"
@@ -106,51 +108,67 @@ def generate_sequence(model, midi_tokenizer, metadata_vocab_map, metadata_prompt
         logging.error(f"Token speciale '{e}' non trovato nei vocabolari.")
         raise ValueError(f"Token speciale '{e}' mancante.")
 
-    meta_token_ids = [metadata_vocab_map.get(token, unk_meta_id) for token in metadata_prompt]
-    src_seq = torch.tensor([[sos_meta_id] + meta_token_ids + [eos_meta_id]], dtype=torch.long, device=device)
-    src_padding_mask = (src_seq == meta_pad_id)
+    # --- INIZIO OTTIMIZZAZIONE ---
 
     with torch.no_grad():
+        # 1. Codifica dei metadati (SRC): eseguita UNA SOLA VOLTA
+        meta_token_ids = [metadata_vocab_map.get(token, unk_meta_id) for token in metadata_prompt]
+        src_seq = torch.tensor([[sos_meta_id] + meta_token_ids + [eos_meta_id]], dtype=torch.long, device=device)
+        src_padding_mask = (src_seq == meta_pad_id)
+        
+        # Calcola l'output dell'encoder (chiamato 'memory') una sola volta.
+        # Questa è la rappresentazione del contesto che il decoder userà ad ogni passo.
         memory = model.encode(src_seq, src_padding_mask)
+
+        # 2. Inizializzazione della sequenza di output (TGT)
+        # Inizia con il token SOS e, opzionalmente, con un "primer"
         initial_ids = [sos_midi_id] + (primer_token_ids if primer_token_ids else [])
         tgt_tokens = torch.tensor([initial_ids], dtype=torch.long, device=device)
         
-        generated_ids_this_chunk = []
+        # 3. Loop di generazione autoregressivo (ora più efficiente)
         for i in range(max_new_tokens):
             current_total_len = tgt_tokens.size(1)
             if current_total_len >= model_max_pe_len:
                 logging.warning(f"Raggiunta capacità massima del modello ({model_max_pe_len}). Interruzione.")
                 break
 
-            tgt_mask_step = torch.triu(torch.ones(current_total_len, current_total_len, device=device, dtype=torch.bool), diagonal=1)
+            # Crea la maschera causale per la sequenza di output corrente
+            tgt_mask = torch.triu(torch.ones(current_total_len, current_total_len, device=device, dtype=torch.bool), diagonal=1)
             
-            decoder_output = model.decode(tgt=tgt_tokens, memory=memory, tgt_mask=tgt_mask_step, memory_key_padding_mask=src_padding_mask)
-            logits = model.generator(decoder_output)
-            last_logits = logits[:, -1, :] / temperature
-
+            # --- CHIAMATA AL DECODER ---
+            # Passiamo l'intera sequenza generata finora.
+            # `memory` (dall'encoder) è sempre lo stesso.
+            decoder_output = model.decode(tgt=tgt_tokens, memory=memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_padding_mask)
+            
+            # Dal decoder_output, usiamo solo l'ultimo token per predire il successivo
+            logits = model.generator(decoder_output[:, -1, :]) # Shape: [batch, vocab_size]
+            
+            # 4. Sampling (Top-K, Temperatura) - invariato
+            scaled_logits = logits / temperature
             if top_k is not None and top_k > 0:
-                v, _ = torch.topk(last_logits, min(top_k, last_logits.size(-1)))
-                last_logits[last_logits < v[:, [-1]]] = -float('Inf')
+                v, _ = torch.topk(scaled_logits, min(top_k, scaled_logits.size(-1)))
+                scaled_logits[scaled_logits < v[:, [-1]]] = -float('Inf')
 
-            probs = F.softmax(last_logits, dim=-1)
+            probs = F.softmax(scaled_logits, dim=-1)
             next_token_id_tensor = torch.multinomial(probs, num_samples=1)
             next_token_id = next_token_id_tensor.item()
 
-            if next_token_id == eos_midi_id and len(generated_ids_this_chunk) < min_new_tokens:
-                # Se il modello vuole finire troppo presto, prendi il secondo token più probabile
+            # 5. Gestione EOS e aggiunta del nuovo token - invariato
+            if next_token_id == eos_midi_id and tgt_tokens.size(1) - len(initial_ids) < min_new_tokens:
                 _, top_2_indices = torch.topk(probs, 2, dim=-1)
                 if top_2_indices[0, 0].item() == eos_midi_id and top_2_indices.size(1) > 1:
                     next_token_id_tensor = top_2_indices[0, 1].unsqueeze(0).unsqueeze(0)
-                    next_token_id = next_token_id_tensor.item()
-
-            if next_token_id == eos_midi_id and len(generated_ids_this_chunk) >= min_new_tokens:
-                generated_ids_this_chunk.append(next_token_id)
+                else: # Se anche il secondo è EOS o c'è un solo token, forza la fine
+                    break 
+            
+            if next_token_id == eos_midi_id and tgt_tokens.size(1) - len(initial_ids) >= min_new_tokens:
                 break
             
-            generated_ids_this_chunk.append(next_token_id)
+            # Aggiungi il nuovo token alla sequenza per il prossimo passo
             tgt_tokens = torch.cat((tgt_tokens, next_token_id_tensor), dim=1)
 
-    return generated_ids_this_chunk
+    # Ritorna i token generati (escludendo il SOS iniziale e il primer)
+    return tgt_tokens[0, len(initial_ids):].tolist()
 
 
 def generate_multi_chunk_midi(model, midi_tokenizer, metadata_vocab_map, metadata_prompt,
