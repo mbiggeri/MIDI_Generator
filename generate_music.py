@@ -502,7 +502,7 @@ def enhance_midi_score(score, cleaning_options: Dict[str, Any], metadata_prompt:
 
     # 2. RIMOZIONE TRACCE VUOTE E NOTE GLITCH (Generalmente sicuro da lasciare attivo)
     log_and_update("- Rimozione tracce vuote e note glitch...")
-    MIN_NOTE_DURATION_TICKS = 30 # Si può mantenere hardcoded o passare tramite opzioni
+    MIN_NOTE_DURATION_TICKS = 10 # Si può mantenere hardcoded o passare tramite opzioni
     for track in score.tracks:
         valid_notes = [n for n in track.notes if n.velocity > 0 and n.duration > MIN_NOTE_DURATION_TICKS]
         track.notes = valid_notes
